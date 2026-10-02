@@ -20,6 +20,11 @@
 - institution_merges 表保存会务方提交的机构归并边 (同一机构的不同原名);
   全表边以并查集解释为冲突判定组, 关系传递且不可拆分, 仅有效归并写入并推进修订号,
   普通分配与补位均按归并组判定"作者同机构"与"两名评审人同机构";
+- review_corrections 表保存会务方发起的评语更正请求与评审人提交的更正
+  (按发布序号 serial 隔离; 每个槽位至多一条未完成请求):
+  发起即令该论文既有作者反馈访问码失效 (快照读取时按 requested_at 判定);
+  首份有效更正把 submitted_reviews 中该槽位的评语就地更新为更正后内容并发放新收据,
+  原评语完整保存在本表 (orig_*) 供会务方追溯; 发布序号变化后未完成请求自然失效;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -139,6 +144,32 @@ CREATE TABLE IF NOT EXISTS institution_merges (
     revision     INTEGER NOT NULL,  -- 本次有效归并推进后的资料修订号
     merged_at    TEXT NOT NULL
 );
+-- 会务方发起的评语更正请求及评审人提交的更正 (按发布序号 serial 隔离)。
+-- 仅允许对"当前仍分配、已确认且已交评语"的槽位发起; 每个槽位在同一序号下
+-- 至多一条未完成请求 (下方部分唯一索引保证)。发起即令该论文既有作者反馈
+-- 访问码失效 (快照读取时比较 requested_at 与快照 created_at); 首份有效更正
+-- 将 submitted_reviews 中该槽位评语就地更新为更正后内容并发放新收据,
+-- 原评语完整保留在本表 (orig_*) 供会务方追溯; 发布序号变化后,
+-- 未完成的更正请求自然失效 (评审人视图与提交均只认当前序号)。
+CREATE TABLE IF NOT EXISTS review_corrections (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial            INTEGER NOT NULL,
+    paper_id          TEXT NOT NULL,
+    reviewer_id       TEXT NOT NULL,
+    reason            TEXT NOT NULL,   -- 会务方发起更正的非空原因
+    orig_score        INTEGER NOT NULL,  -- 被更正的原评语内容 (追溯用)
+    orig_comment      TEXT NOT NULL,
+    orig_receipt      TEXT NOT NULL,   -- 原评语收据 (评审人提交更正时须携带)
+    orig_submitted_at TEXT NOT NULL,
+    new_score         INTEGER,         -- 更正后的评分/评语/收据 (未更正为 NULL)
+    new_comment       TEXT,
+    new_receipt       TEXT,
+    requested_at      TEXT NOT NULL,
+    corrected_at      TEXT
+);
+-- 同一 (serial, paper_id, reviewer_id) 至多一条未完成 (corrected_at IS NULL) 的更正请求
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_corrections_open
+    ON review_corrections(serial, paper_id, reviewer_id) WHERE corrected_at IS NULL;
 """
 
 

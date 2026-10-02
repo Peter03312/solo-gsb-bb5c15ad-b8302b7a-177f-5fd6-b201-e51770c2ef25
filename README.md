@@ -91,6 +91,34 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
   含每版序号、访问码、评语收据及是否当前有效）；
 - **无效码/已失效码统一 `404`**，响应体相同，**不透露论文是否存在**。
 
+**评语更正（会务方发起、评审人提交）**：会务方发现已交评语需要更正时，凭密钥对
+`POST /papers/{paper_id}/review-corrections` 提交**当前发布序号 `serial`、论文、评审人
+与非空原因**，发起更正请求：
+
+- 仅允许对**当前仍分配、已确认且已交评语**的槽位发起：尚未发布/论文不在当前发布版/
+  评审人不在该论文槽位（已移出）`404`，发布序号过期/超前 `409`，
+  槽位 `pending`/`recused` 或尚未交评语 `409`，原因为空白 `422`；
+  同一槽位已有**未完成**请求时，同原因重复提交幂等（`changed=false`），异原因 `409`；
+- **更正请求发起即令该稿既有作者反馈访问码失效**（持码读取立即 `404`）；
+  更正请求不推进资料修订号与发布序号；
+- 评审人凭现有本人凭据 `GET /reviewer/review-corrections` 查看**自己的待更正任务**
+  （含原评语收据与内容，看不到他人任务），并对
+  `POST /reviewer/review-corrections/{paper_id}` 以**请求对应的发布序号和原评语收据**
+  提交新的 **1～5 整数评分**与**非空评语**：
+  序号过期/超前 `409`，收据与请求不符 `409`，本人无待更正任务 `404`，
+  非法评分/空评语 `422`；
+- **首份有效更正**生成**新收据**，该槽位评语更新为更正后内容，
+  **原评语完整保留**供会务方追溯（`GET /papers/{paper_id}/review-corrections`，
+  含每次请求的原因、状态 `open/fulfilled/expired`、原评语与更正后内容）；
+  **同内容重试**幂等返回更正收据（`changed=false`），**异内容** `409` 冲突；
+- 更正后该论文快照须由会务方**按现有完整性规则重新发布**
+  （同序号下收据已变 → 新版本与新访问码）；
+- **发布序号变化后，未完成的待更正请求失效**（评审人任务列表不再出现，
+  按旧序号提交 `409`，会务方追溯中标记 `expired`）；
+- 补位发布时**保留槽位沿用更正后的评语**（新收据），**被移出槽位的更正评语照常归档**；
+  既有正式评语首提交接口的一次提交与冲突语义不变（更正后的评语即该槽位当前评语），
+  评审人不得查看他人评语。
+
 **评审资格停用/启用（会务方）**：既有评审人初始视为**启用**。会务方凭密钥对
 `POST /reviewers/{reviewer_id}/status` 提交**评审人编号、所见资料修订号 `base_revision`、
 目标状态 `active`（`false` 停用 / `true` 启用）与非空原因**：
@@ -138,8 +166,8 @@ SQLite 写事务**（`BEGIN IMMEDIATE`）内完成，与资料修改并发不会
 
 | 角色 | 凭据 | 权限 |
 |---|---|---|
-| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照、停用/启用评审资格并查看变更记录 |
-| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 资格启用时：对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语；资格停用后凭据仍有效但上述操作一律 `403` |
+| 会务方 | 本地密钥（请求头 `X-Organizer-Key`） | 维护资料、预演、发布、查询分配与排除原因、按论文查看评审评语与提交进度、发布与追溯面向作者的匿名反馈快照、停用/启用评审资格并查看变更记录、发起评语更正请求并追溯更正记录 |
+| 评审人 | 自身凭据（`X-Reviewer-Id` + `X-Reviewer-Credential`） | 资格启用时：对已发布方案中分配给自己的任务确认/回避、读取匿名稿（不含作者机构）、提交并查看本人正式评语、查看本人待更正任务并提交更正；资格停用后凭据仍有效但上述操作一律 `403` |
 | 持码者 | 快照随机访问码（路径参数，无需请求头） | 仅可读取对应论文**当前有效**的匿名反馈快照（论文编号 + 标号 1、2 的评分与评语） |
 
 ## 一键启动（Docker Compose）
@@ -207,6 +235,10 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 | POST | `/assignment/backfill/publish` | 补位发布：`{"base_revision": N, "base_serial": M}` 双版本复核，过期 `409`，补不齐 `422` |
 | GET | `/assignment` | 查询已发布方案（含 `serial`）及每篇论文的分配/排除原因、每槽位确认/回避状态 |
 | GET | `/papers/{paper_id}/reviews` | 会务方按论文查看当前两名评审人的评语提交进度、评语全文，及被移出槽位的追溯评语（`archived_reviews`） |
+| POST | `/papers/{paper_id}/review-corrections` | 会务方发起评语更正请求：`{"paper_id","reviewer_id","serial","reason"}`；仅限当前仍分配、已确认且已交评语的槽位；旧序号 `409`，已移出槽位 `404`，未确认/未交评语 `409`，空原因 `422`；同槽位同原因重复发起幂等（`changed=false`），异原因 `409`；发起即令该稿既有反馈访问码失效 |
+| GET | `/papers/{paper_id}/review-corrections` | 会务方追溯某论文的全部更正请求与结果（原因、状态 `open/fulfilled/expired`、原评语、更正后内容与双方收据） |
+| GET | `/reviewer/review-corrections` | 评审人查看本人当前发布序号下的待更正任务（含原评语收据与内容；序号变化后旧请求不再出现；**资格停用 `403`**） |
+| POST | `/reviewer/review-corrections/{paper_id}` | 评审人提交更正：`{"paper_id","serial","receipt","score":1~5整数,"comment"}`；首份有效更正发新收据并保留原评语；同内容重试返更正收据（`changed=false`），异内容 `409`，收据不符 `409`，无待更正任务 `404`，序号过期/超前 `409`，非法评分/空评语 `422`，**资格停用 `403`** |
 | POST | `/papers/{paper_id}/feedback-snapshot` | 会务方发布面向作者的匿名反馈快照：`{"serial": N}`；资料不齐 `422` 不留新版，序号过期/超前 `409`，未发布/论文不在方案 `404`；成功返回随机访问码与快照，同序号同两份评语收据重复请求返回原码（`changed=false`） |
 | GET | `/feedback-snapshots/{access_code}` | 持码者读取当前有效快照（**无需凭据**）：仅论文编号与标号 1、2 的两份评分和评语；无效码/已失效旧码统一 `404` |
 | GET | `/papers/{paper_id}/feedback-snapshots` | 会务方追溯某论文的全部快照版本（含已失效旧版、访问码、评语收据与当前有效标记） |
@@ -227,7 +259,9 @@ Compose 下可用 `ORGANIZER_KEY=xxx PORT=9000 docker compose up -d` 覆盖。
 本轮评审资格停用/启用流程见 [`examples/eligibility.sh`](examples/eligibility.sh)
 （`./examples/eligibility.sh`，建议对新库运行）；
 本轮机构归并流程见 [`examples/institutions.sh`](examples/institutions.sh)
-（`./examples/institutions.sh`，建议对新库运行）。
+（`./examples/institutions.sh`，建议对新库运行）；
+本轮评语更正流程见 [`examples/corrections.sh`](examples/corrections.sh)
+（`./examples/corrections.sh`，建议对新库运行）。
 
 ```bash
 BASE=http://localhost:8000
@@ -424,6 +458,50 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
   -d '{"base_revision": N, "base_serial": S}'
 ```
 
+### 本轮用法：评语更正（会务方发起、评审人提交）
+
+```bash
+# 31. 会务方对已交评语发起更正请求 (当前发布序号 + 论文 + 评审人 + 非空原因)
+curl -X POST $BASE/papers/P1/review-corrections -H "$ORG" \
+  -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "reviewer_id": "R1", "serial": S, "reason": "评分与评语明显不符, 请复核"}'
+# -> {"ok":true,"serial":S,"changed":true,"requested_at":"...",
+#     "original":{"score":4,"comment":"...","receipt":"rvw-aaaa",...}}
+#    仅限当前仍分配、已确认且已交评语的槽位: 旧序号 409, 已移出槽位 404,
+#    未确认/未交评语 409, 空原因 422; 同槽位同原因重复发起幂等, 异原因 409
+#    发起即令该稿既有作者反馈访问码失效 (持码读取立即 404)
+
+# 32. 评审人凭本人凭据查看自己的待更正任务 (含原评语收据; 看不到他人任务)
+curl $BASE/reviewer/review-corrections -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret'
+# -> {"reviewer_id":"R1","serial":S,"corrections":[
+#     {"paper_id":"P1","serial":S,"reason":"...",
+#      "original":{"score":4,"comment":"...","receipt":"rvw-aaaa",...}}]}
+
+# 33. 评审人以请求对应的发布序号 + 原评语收据提交更正 (新 1~5 整数评分与非空评语)
+curl -X POST $BASE/reviewer/review-corrections/P1 \
+  -H 'X-Reviewer-Id: R1' -H 'X-Reviewer-Credential: r1-secret' \
+  -H 'Content-Type: application/json' \
+  -d '{"paper_id": "P1", "serial": S, "receipt": "rvw-aaaa",
+       "score": 5, "comment": "更正后: 选题重要且实验充分, 建议接收。"}'
+# -> {"ok":true,"receipt":"rvw-bbbb","original_receipt":"rvw-aaaa","changed":true,...}
+#    首份有效更正发新收据, 原评语留档; 同内容重试返更正收据 (changed=false),
+#    异内容 409; 收据不符 409; 无待更正任务 404; 序号过期/超前 409
+
+# 34. 会务方追溯更正记录 (原评语与更正后内容、双方收据、状态)
+curl $BASE/papers/P1/review-corrections -H "$ORG"
+# -> {"paper_id":"P1","current_serial":S,"corrections":[
+#     {"serial":S,"reviewer_id":"R1","reason":"...","status":"fulfilled",
+#      "original":{"score":4,"comment":"...","receipt":"rvw-aaaa",...},
+#      "correction":{"score":5,"comment":"...","receipt":"rvw-bbbb",...}}]}
+
+# 35. 更正后由会务方按现有完整性规则重新发布快照 (同序号, 收据已变 -> 新版本新码)
+curl -X POST $BASE/papers/P1/feedback-snapshot -H "$ORG" \
+  -H 'Content-Type: application/json' -d '{"serial": S}'
+# -> {"version": V+1, "access_code": "fbk-...(新码)", "changed": true, ...}
+#    旧访问码保持 404; 发布序号变化后, 未完成的待更正请求失效 (expired),
+#    补位保留槽位沿用更正后的评语, 被移出槽位的更正评语照常归档
+```
+
 预演响应示例（可行）：
 
 ```json
@@ -460,10 +538,10 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 | 状态码 | 场景 |
 |---|---|
 | 401 | 会务方密钥缺失/错误；评审人凭据缺失/失效 |
-| 403 | 评审资格已停用：凭据本身仍有效，但取稿、提交决定、提交评语、查看本人评语一律立即拒绝 |
-| 404 | 更新/删除不存在的论文或评审人；调整资格或查看变更记录时评审人未知；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照；机构归并时任一名称未出现在当前论文作者或评审人资料中 |
-| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前；资格调整携带的修订号过期/超前；同状态异原因的资格调整（含对初始启用者再次启用）；机构归并携带的修订号过期/超前 |
-| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；路径评审人编号与请求体不一致；资格调整原因为空；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本）；机构归并的名称去首尾空白后为空白 |
+| 403 | 评审资格已停用：凭据本身仍有效，但取稿、提交决定、提交评语、查看本人评语、查看待更正任务与提交更正一律立即拒绝 |
+| 404 | 更新/删除不存在的论文或评审人；调整资格或查看变更记录时评审人未知；尚未发布方案；评审人对**未分配给自己/已被移出当前方案**的论文提交决定或评语；会务方查询当前发布版中不存在的论文评语；尚无发布版时补位预演/发布；反馈快照的访问码无效或已失效（旧码或因更正请求失效的码，不区分论文是否存在）；未发布或论文不在当前发布版时发布快照；机构归并时任一名称未出现在当前论文作者或评审人资料中；更正请求针对未发布/不在当前发布版的论文或未分配给该评审人的槽位；评审人提交更正时本人无待更正任务 |
+| 409 | 论文/评审人编号重复；发布携带的修订号已过期（资料已变更）；补位发布携带的资料修订号或发布序号过期；已回避任务再次确认；评语提交携带的发布序号过期/超前；对 `pending`/`recused` 槽位提交评语；同一有效任务已有评语而提交内容不同（冲突）；反馈快照请求携带的发布序号过期/超前；资格调整携带的修订号过期/超前；同状态异原因的资格调整（含对初始启用者再次启用）；机构归并携带的修订号过期/超前；更正请求携带的发布序号过期/超前、槽位未确认/未交评语、同槽位已有异原因的未完成请求；更正提交携带的发布序号过期/超前、收据与请求不符、或同一任务已有内容不同的更正 |
+| 422 | 非法容量（非整数、小于 1）、缺字段等参数校验失败；无可行方案时强行发布；回避原因为空；补位预演无法补齐为完整方案时强行补位发布；评分不是 1～5 的整数或评语为空白；路径论文编号与请求体不一致；路径评审人编号与请求体不一致；资格调整原因为空；发布反馈快照时两名评审人未全部确认或两份正式评语未交齐（不留下新版本）；机构归并的名称去首尾空白后为空白；更正请求原因为空；更正评分不是 1～5 的整数或更正评语为空白 |
 
 排除/限制原因代码：`same_institution_as_author`（与作者同机构，原名逐字相同）、
 `same_institution_as_author_via_merge`（评审人与作者机构原名不同但已归并为同一冲突判定组）、
@@ -489,9 +567,9 @@ curl -X POST $BASE/assignment/backfill/publish -H "$ORG" \
 
 ```
 app/
-  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用、机构归并组
+  main.py     # FastAPI 路由、鉴权、发布/补位发布事务、评审人决定与正式评语、匿名反馈快照、评审资格停用/启用、机构归并组、评语更正
   solver.py   # 分配求解器 + 补位求解器（固定位置、容量比例、字典序、部分方案与诊断；停用者直接排除；机构冲突一律按归并组判定）
-  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录、机构归并边与并查集分组
+  db.py       # SQLite 连接、schema 初始化/迁移、修订号、发布序号、读写事务、评审资格状态与变更记录、机构归并边与并查集分组、评语更正记录
   schemas.py  # 请求体模型与校验
 tests/test_api.py                # 原有接口与求解器测试（含并发发布测试）
 tests/test_backfill.py           # 确认/回避/硬回避/补位预演与发布测试
@@ -499,12 +577,14 @@ tests/test_reviews.py            # 正式评分/评语、收据幂等与冲突�
 tests/test_snapshots.py          # 匿名反馈快照：发布门槛、幂等原码、新版本旧码失效、统一 404、追溯
 tests/test_eligibility.py        # 评审资格停用/启用：修订号核对、幂等/冲突、即时 403、槽位释放与恢复、变更记录
 tests/test_institution_merges.py # 本轮机构归并：修订号核对、传递不可拆分、幂等、归并组冲突判定、预演归并标注、补位失效不固定、评语继承
+tests/test_corrections.py        # 本轮评语更正：发起校验、访问码失效、待更正任务、收据幂等与冲突、序号失效、补位沿用/归档
 examples/demo.sh          # 端到端 curl 示例（录入 -> 预演 -> 发布 -> 取稿）
 examples/backfill.sh      # 确认/回避 -> 补位预演 -> 双版本复核发布示例
 examples/reviews.sh       # 正式评语收集端到端示例（确认 -> 提交评语 -> 进度查看 -> 补位沿用/归档）
 examples/snapshots.sh     # 匿名反馈快照端到端示例（发布快照 -> 持码读取 -> 幂等 -> 序号变化旧码失效 -> 追溯）
 examples/eligibility.sh   # 评审资格停用/启用端到端示例（停用 -> 即时断稿/排除 -> 补位释放 -> 重新启用 -> 变更记录）
 examples/institutions.sh  # 本轮端到端示例（机构归并 -> 普通分配按组冲突 -> 已确认槽位失效 -> 补位双版本发布 -> 归并组查看）
+examples/corrections.sh   # 本轮端到端示例（发起更正 -> 访问码失效 -> 待更正任务 -> 提交更正 -> 重新发布快照 -> 序号变化请求失效）
 Dockerfile / docker-compose.yml
 ```
 
