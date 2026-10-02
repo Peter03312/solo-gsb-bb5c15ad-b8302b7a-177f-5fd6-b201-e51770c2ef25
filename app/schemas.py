@@ -73,3 +73,18 @@ class InstitutionMergeIn(BaseModel):
     name_a: str = Field(min_length=1, max_length=256, description="当前论文作者或评审人资料中出现的机构原名")
     name_b: str = Field(min_length=1, max_length=256, description="当前论文作者或评审人资料中出现的机构原名")
     base_revision: int = Field(ge=0, description="所见到的资料修订号; 与当前不一致即过期")
+
+
+class ReviewCorrectionRequestIn(BaseModel):
+    paper_id: str = Field(min_length=1, max_length=128, description="需要更正评语的论文编号")
+    serial: int = Field(ge=1, description="当前发布序号; 与当前发布序号不一致即过期")
+    reviewer_id: str = Field(min_length=1, max_length=128, description="被更正评语所属的评审人编号")
+    reason: str = Field(min_length=1, max_length=1000, description="非空更正原因 (首尾空白归一化后仍须非空)")
+
+
+class ReviewCorrectionSubmitIn(BaseModel):
+    paper_id: str = Field(min_length=1, max_length=128, description="待更正任务对应的论文编号")
+    serial: int = Field(ge=1, description="更正请求对应的发布序号; 与当前发布序号不一致即过期")
+    original_receipt: str = Field(min_length=1, max_length=128, description="被更正评语的收据")
+    score: StrictInt = Field(ge=1, le=5, description="更正后的 1~5 整数评分")
+    comment: str = Field(min_length=1, max_length=10000, description="更正后的非空评语")

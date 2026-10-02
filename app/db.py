@@ -20,6 +20,10 @@
 - institution_merges 表保存会务方提交的机构归并边 (同一机构的不同原名);
   全表边以并查集解释为冲突判定组, 关系传递且不可拆分, 仅有效归并写入并推进修订号,
   普通分配与补位均按归并组判定"作者同机构"与"两名评审人同机构";
+- review_corrections 表保存会务方针对已交评语发起的更正请求 (按发布序号 serial 隔离;
+  发起时冻结原评语内容/收据供会务方追溯, 并令该稿当前序号的反馈快照访问码立即失效);
+  评审人提交的首份有效更正生成新收据并更新该槽位评语 (state: pending -> completed),
+  相同内容重试幂等返回更正收据, 内容不同冲突; 发布序号变化后待更正请求自然失效;
 - 发布 = 在同一个写事务内 "校验修订号 -> 重算 -> 写入",
   因此与资料修改并发时不会产生基于旧版资料的方案。
 """
@@ -126,6 +130,7 @@ CREATE TABLE IF NOT EXISTS feedback_snapshots (
     review1      TEXT NOT NULL,   -- 冻结 JSON: {"score":..,"comment":..}
     review2      TEXT NOT NULL,   -- 冻结 JSON: {"score":..,"comment":..}
     created_at   TEXT NOT NULL,
+    invalidated  INTEGER NOT NULL DEFAULT 0,  -- 1=更正请求发起后访问码立即失效
     UNIQUE (paper_id, serial, receipt1, receipt2)
 );
 -- 会务方提交的机构归并边 (同一机构的不同原名)。归并关系传递且不可拆分:
@@ -139,6 +144,29 @@ CREATE TABLE IF NOT EXISTS institution_merges (
     revision     INTEGER NOT NULL,  -- 本次有效归并推进后的资料修订号
     merged_at    TEXT NOT NULL
 );
+-- 会务方针对已交评语发起的更正请求 (按发布序号 serial 隔离)。
+-- 发起时冻结原评语 (评分/评语/收据/提交时间) 供会务方追溯; 评审人凭
+-- "请求对应的发布序号 + 原评语收据" 提交更正, 首份有效更正生成新收据并
+-- 直接更新该槽位的正式评语 (state 置 completed, 记录更正后内容/新收据/时间),
+-- 相同内容重试幂等返回更正收据, 内容不同按冲突拒绝;
+-- 发布序号变化后, 旧序号下的待更正请求自然失效 (不再列出也不可提交)。
+CREATE TABLE IF NOT EXISTS review_corrections (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    serial               INTEGER NOT NULL,   -- 更正请求针对的发布序号
+    paper_id             TEXT NOT NULL,
+    reviewer_id          TEXT NOT NULL,
+    reason               TEXT NOT NULL,      -- 会务方填写的非空更正原因
+    original_score       INTEGER NOT NULL,   -- 被更正评语的冻结内容 (供会务方追溯)
+    original_comment     TEXT NOT NULL,
+    original_receipt     TEXT NOT NULL,      -- 被更正评语的收据
+    original_submitted_at TEXT NOT NULL,
+    state                TEXT NOT NULL CHECK (state IN ('pending', 'completed')),
+    new_score            INTEGER,            -- 更正后内容 (completed 时非空)
+    new_comment          TEXT,
+    new_receipt          TEXT,               -- 更正评语的新收据
+    requested_at         TEXT NOT NULL,
+    corrected_at         TEXT
+);
 """
 
 
@@ -151,6 +179,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "active" not in reviewer_cols:
         # 既有评审人初始视为启用
         conn.execute("ALTER TABLE reviewers ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    snapshot_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback_snapshots)").fetchall()}
+    if "invalidated" not in snapshot_cols:
+        # 既有快照默认未被更正请求失效
+        conn.execute(
+            "ALTER TABLE feedback_snapshots ADD COLUMN invalidated INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 def get_conn() -> sqlite3.Connection:

@@ -24,6 +24,8 @@ from .schemas import (
     PaperIn,
     PaperUpdate,
     PublishIn,
+    ReviewCorrectionRequestIn,
+    ReviewCorrectionSubmitIn,
     ReviewSubmissionIn,
     ReviewerIn,
     ReviewerStatusIn,
@@ -189,6 +191,35 @@ def _load_reviews(conn, serial):
             " FROM submitted_reviews WHERE serial = ?",
             (serial,),
         ).fetchall()
+    }
+
+
+def _correction_view(c):
+    """更正记录的会务方追溯视图: 冻结的原评语 + 更正后内容 (pending 时为 None)。"""
+    return {
+        "correction_id": c["id"],
+        "serial": c["serial"],
+        "paper_id": c["paper_id"],
+        "reviewer_id": c["reviewer_id"],
+        "reason": c["reason"],
+        "state": c["state"],
+        "original": {
+            "score": c["original_score"],
+            "comment": c["original_comment"],
+            "receipt": c["original_receipt"],
+            "submitted_at": c["original_submitted_at"],
+        },
+        "corrected": (
+            None
+            if c["state"] != "completed"
+            else {
+                "score": c["new_score"],
+                "comment": c["new_comment"],
+                "receipt": c["new_receipt"],
+                "corrected_at": c["corrected_at"],
+            }
+        ),
+        "requested_at": c["requested_at"],
     }
 
 
@@ -715,6 +746,7 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
       进度统计 submitted/confirmed 只计当前槽位;
     - archived 为该论文在往次发布序号上、但已不属于当前方案的评语
       (补位被移出槽位的评语仅供会务方追溯, 不计入新方案进度);
+    - corrections 为该论文全部更正请求记录 (冻结的原评语与更正后内容, 供会务方追溯);
     - 被移出后同一评审人后来重新获得该稿时为新序号下的新槽位, 旧评语不会复用。
     """
     with db.read_txn() as conn:
@@ -774,6 +806,13 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
             # 被移出槽位 (含同一人后来重新获稿前的旧评语) 均保留供会务方追溯
             if r["receipt"] not in current_receipts
         ]
+        corrections = [
+            _correction_view(c)
+            for c in conn.execute(
+                "SELECT * FROM review_corrections WHERE paper_id = ? ORDER BY id",
+                (paper_id,),
+            ).fetchall()
+        ]
     confirmed = sum(1 for s in slots if s["state"] == "confirmed")
     submitted = sum(1 for s in slots if s["submitted"])
     return {
@@ -787,6 +826,140 @@ def paper_reviews(paper_id: str, _: bool = Depends(require_organizer)):
         },
         "slots": slots,
         "archived_reviews": archived,
+        "corrections": corrections,
+    }
+
+
+# ------------------------------------------------ 已交评语更正 (会务方发起)
+
+@app.post("/papers/{paper_id}/review-corrections")
+def request_review_correction(
+    paper_id: str,
+    body: ReviewCorrectionRequestIn,
+    _: bool = Depends(require_organizer),
+):
+    """会务方针对当前发布版中已交评语发起更正请求。
+
+    - 请求须携带当前发布序号 serial 与非空原因: 序号过期/超前 409, 原因为空白 422;
+      尚未发布 404; 论文不在当前发布版 404; 评审人不在该论文当前槽位
+      (旧序号或已被移出方案的槽位) 404;
+    - 只允许"当前仍分配、已确认且已交评语"的槽位: 槽位 pending/recused 409,
+      尚未提交正式评语 409;
+    - 同一槽位已有待完成的更正请求时: 相同原因的重复请求幂等返回 (changed=false),
+      不同原因 409;
+    - 发起即在同一个写事务内令该论文当前序号的全部作者反馈访问码失效
+      (invalidated_snapshots 为本次失效的版数), 并冻结原评语供会务方追溯;
+    - 更正请求不影响资料修订号与发布序号; 发布序号变化后, 旧序号下的待更正请求失效。
+    """
+    if body.paper_id != paper_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径中的论文编号 ({paper_id}) 与请求体 ({body.paper_id}) 不一致",
+        )
+    reason = body.reason.strip()
+    if not reason:
+        raise HTTPException(
+            status_code=422, detail="更正原因必须非空 (non-empty reason is required)"
+        )
+
+    now = datetime.now(timezone.utc).isoformat()
+    with db.write_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 无可更正的评语")
+        current_serial = published["serial"]
+        if body.serial != current_serial:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"发布序号已过期: 更正请求针对序号 {body.serial},"
+                    f" 当前发布序号为 {current_serial}, 请按当前发布版重新发起"
+                ),
+            )
+        plan = json.loads(published["plan"])
+        pair = plan.get(paper_id)
+        if not pair:
+            raise HTTPException(
+                status_code=404, detail=f"当前发布版中不存在论文 {paper_id} 的分配"
+            )
+        if body.reviewer_id not in pair:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"当前发布版中论文 {paper_id} 未分配给 {body.reviewer_id};"
+                    " 旧序号或已移出方案的槽位不可发起更正"
+                ),
+            )
+        decision = conn.execute(
+            "SELECT state FROM assignment_decisions"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+            (current_serial, paper_id, body.reviewer_id),
+        ).fetchone()
+        if decision is None or decision["state"] != "confirmed":
+            state = decision["state"] if decision else "pending"
+            raise HTTPException(
+                status_code=409,
+                detail=f"论文 {paper_id} 的槽位当前为 {state} 状态; 仅已确认且未回避的槽位可发起更正",
+            )
+        review = conn.execute(
+            "SELECT score, comment, receipt, submitted_at FROM submitted_reviews"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+            (current_serial, paper_id, body.reviewer_id),
+        ).fetchone()
+        if review is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"评审人 {body.reviewer_id} 尚未对论文 {paper_id} 提交正式评语, 无可更正内容",
+            )
+        pending = conn.execute(
+            "SELECT * FROM review_corrections"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ? AND state = 'pending'",
+            (current_serial, paper_id, body.reviewer_id),
+        ).fetchone()
+        if pending is not None:
+            if pending["reason"] == reason:
+                # 相同原因的重复请求: 幂等返回既有待更正请求
+                return {"ok": True, "changed": False, "invalidated_snapshots": 0,
+                        **_correction_view(pending)}
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "该槽位已存在待完成的更正请求, 不同原因的重复发起按冲突拒绝",
+                    "existing": _correction_view(pending),
+                },
+            )
+        cur = conn.execute(
+            "INSERT INTO review_corrections"
+            "(serial, paper_id, reviewer_id, reason, original_score, original_comment,"
+            " original_receipt, original_submitted_at, state, requested_at)"
+            " VALUES (?,?,?,?,?,?,?,?, 'pending', ?)",
+            (
+                current_serial,
+                paper_id,
+                body.reviewer_id,
+                reason,
+                review["score"],
+                review["comment"],
+                review["receipt"],
+                review["submitted_at"],
+                now,
+            ),
+        )
+        correction_id = cur.lastrowid
+        # 发起即令该稿既有作者反馈访问码失效
+        invalidated = conn.execute(
+            "UPDATE feedback_snapshots SET invalidated = 1"
+            " WHERE paper_id = ? AND serial = ? AND invalidated = 0",
+            (paper_id, current_serial),
+        ).rowcount
+        row = conn.execute(
+            "SELECT * FROM review_corrections WHERE id = ?", (correction_id,)
+        ).fetchone()
+    return {
+        "ok": True,
+        "changed": True,
+        **_correction_view(row),
+        "invalidated_snapshots": invalidated,
     }
 
 
@@ -829,7 +1002,9 @@ def publish_feedback_snapshot(
       否则 422 且不写入任何新版本;
     - 相同发布序号及两份评语收据的重复请求幂等返回原快照与原访问码 (changed=false);
       来源变化 (补位/重新发布导致序号前进、评语为新收据) 后生成新版本
-      (version+1) 与新随机访问码, 旧码立即失效, 旧版保留仅供会务方追溯。
+      (version+1) 与新随机访问码, 旧码立即失效, 旧版保留仅供会务方追溯;
+    - 该论文在当前序号下存在待完成的评语更正请求时拒绝发布 (409):
+      更正请求发起时既有访问码已失效, 须待更正完成后按当前评语重新发布。
     """
     now = datetime.now(timezone.utc).isoformat()
     with db.write_txn() as conn:
@@ -854,6 +1029,22 @@ def publish_feedback_snapshot(
             )
         decisions = _load_decisions(conn, current_serial)
         reviews = _load_reviews(conn, current_serial)
+        pending_corrections = conn.execute(
+            "SELECT reviewer_id FROM review_corrections"
+            " WHERE serial = ? AND paper_id = ? AND state = 'pending' ORDER BY id",
+            (current_serial, paper_id),
+        ).fetchall()
+        if pending_corrections:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "该论文存在待完成的评语更正请求, 既有访问码已失效;"
+                        " 须待更正完成后按当前评语重新发布快照"
+                    ),
+                    "pending_corrections": [c["reviewer_id"] for c in pending_corrections],
+                },
+            )
         slots = [
             (rid, decisions.get((paper_id, rid)), reviews.get((paper_id, rid)))
             for rid in pair  # 方案槽位顺序 (评审人编号字典序) 即快照标号 1、2 的固定顺序
@@ -951,9 +1142,9 @@ def read_feedback_snapshot(access_code: str):
         if row is None:
             raise _SNAPSHOT_INVALID_CODE
         published = _load_published(conn)
-        # 快照仅在其发布序号仍为当前发布序号时有效; 发布序号单调递增,
-        # 序号相同即意味着该论文没有更新的快照版本
-        if published is None or published["serial"] != row["serial"]:
+        # 快照仅在其发布序号仍为当前发布序号且未被更正请求失效时有效;
+        # 发布序号单调递增, 序号相同即意味着该论文没有更新的快照版本
+        if published is None or published["serial"] != row["serial"] or row["invalidated"]:
             raise _SNAPSHOT_INVALID_CODE
         return _snapshot_public(row)
 
@@ -966,7 +1157,7 @@ def list_feedback_snapshots(paper_id: str, _: bool = Depends(require_organizer))
         current_serial = published["serial"] if published else None
         rows = conn.execute(
             "SELECT version, serial, receipt1, receipt2, access_code,"
-            " review1, review2, created_at FROM feedback_snapshots"
+            " review1, review2, created_at, invalidated FROM feedback_snapshots"
             " WHERE paper_id = ? ORDER BY version",
             (paper_id,),
         ).fetchall()
@@ -975,7 +1166,7 @@ def list_feedback_snapshots(paper_id: str, _: bool = Depends(require_organizer))
                 "version": r["version"],
                 "serial": r["serial"],
                 "access_code": r["access_code"],
-                "active": current_serial == r["serial"],
+                "active": current_serial == r["serial"] and not r["invalidated"],
                 "receipts": [r["receipt1"], r["receipt2"]],
                 "reviews": [
                     {"label": 1, **json.loads(r["review1"])},
@@ -1293,6 +1484,137 @@ def reviewer_reviews(reviewer_id: str = Depends(require_active_reviewer)):
                 }
             )
     return {"reviewer_id": reviewer_id, "serial": serial, "reviews": out}
+
+
+# ------------------------------------------------ 评审人评语更正
+
+@app.get("/reviewer/review-corrections")
+def reviewer_correction_tasks(reviewer_id: str = Depends(require_active_reviewer)):
+    """评审人查看本人在当前发布版上的待更正任务 (会务方发起的评语更正请求)。
+
+    仅列出当前发布序号下状态为待更正 (pending) 的任务, 含会务方填写的更正原因
+    与被更正评语的冻结内容 (本人评语); 发布序号变化后, 旧序号下的待更正请求失效,
+    不再列出。不包含其他评审人的任何信息。
+    """
+    with db.read_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            return {"reviewer_id": reviewer_id, "serial": None, "corrections": []}
+        serial = published["serial"]
+        rows = conn.execute(
+            "SELECT * FROM review_corrections"
+            " WHERE serial = ? AND reviewer_id = ? AND state = 'pending' ORDER BY id",
+            (serial, reviewer_id),
+        ).fetchall()
+    return {
+        "reviewer_id": reviewer_id,
+        "serial": serial,
+        "corrections": [_correction_view(r) for r in rows],
+    }
+
+
+@app.post("/reviewer/review-corrections/{paper_id}")
+def submit_review_correction(
+    paper_id: str,
+    body: ReviewCorrectionSubmitIn,
+    reviewer_id: str = Depends(require_active_reviewer),
+):
+    """评审人按待更正任务提交更正后的正式评分与评语。
+
+    - 请求体须携带更正请求对应的发布序号 serial 与原评语收据 original_receipt:
+      序号过期/超前 409; 不存在对应的 (待) 更正任务 404;
+    - 评分必须是 1~5 的整数, 评语去除首尾空白后必须非空, 否则 422;
+    - 首份有效更正生成新收据, 并直接更新该槽位的正式评语 (原评语在更正记录中
+      冻结保留, 供会务方追溯);
+    - 同一更正任务只收一份: 评分与评语 (首尾空白归一化后) 完全相同的重试
+      幂等返回更正收据 (changed=false); 内容不同 409 冲突, 已存更正不变;
+    - 发布序号变化后, 旧序号下的待更正请求失效, 不可再提交;
+    - 被拒请求不落库, 也不推进资料修订号。
+    """
+    if body.paper_id != paper_id:
+        raise HTTPException(
+            status_code=422,
+            detail=f"路径中的论文编号 ({paper_id}) 与请求体 ({body.paper_id}) 不一致",
+        )
+    comment = body.comment.strip()
+    if not comment:
+        raise HTTPException(status_code=422, detail="更正评语必须非空 (non-empty comment is required)")
+
+    with db.write_txn() as conn:
+        published = _load_published(conn)
+        if published is None:
+            raise HTTPException(status_code=404, detail="尚未发布任何分配方案, 不存在待更正任务")
+        current_serial = published["serial"]
+        if body.serial != current_serial:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"发布序号已过期: 更正提交针对序号 {body.serial},"
+                    f" 当前发布序号为 {current_serial}, 待更正请求已失效"
+                ),
+            )
+        corr = conn.execute(
+            "SELECT * FROM review_corrections"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ? AND original_receipt = ?",
+            (current_serial, paper_id, reviewer_id, body.original_receipt),
+        ).fetchone()
+        if corr is None:
+            raise HTTPException(
+                status_code=404,
+                detail="不存在与该收据对应的更正任务 (或该任务已随发布序号变化而失效)",
+            )
+        if corr["state"] == "completed":
+            if corr["new_score"] == body.score and corr["new_comment"] == comment:
+                # 完全相同的重试: 原样返回更正收据
+                return {
+                    "ok": True,
+                    "paper_id": paper_id,
+                    "reviewer_id": reviewer_id,
+                    "serial": current_serial,
+                    "correction_id": corr["id"],
+                    "score": corr["new_score"],
+                    "comment": corr["new_comment"],
+                    "receipt": corr["new_receipt"],
+                    "original_receipt": corr["original_receipt"],
+                    "corrected_at": corr["corrected_at"],
+                    "changed": False,
+                }
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "该更正任务已有一份更正评语, 内容不一致的提交按冲突拒绝",
+                    "existing": {
+                        "score": corr["new_score"],
+                        "receipt": corr["new_receipt"],
+                        "corrected_at": corr["corrected_at"],
+                    },
+                },
+            )
+        now = datetime.now(timezone.utc).isoformat()
+        receipt = f"rvw-{secrets.token_hex(8)}"
+        conn.execute(
+            "UPDATE submitted_reviews SET score = ?, comment = ?, receipt = ?, submitted_at = ?"
+            " WHERE serial = ? AND paper_id = ? AND reviewer_id = ?",
+            (body.score, comment, receipt, now, current_serial, paper_id, reviewer_id),
+        )
+        conn.execute(
+            "UPDATE review_corrections SET state = 'completed', new_score = ?,"
+            " new_comment = ?, new_receipt = ?, corrected_at = ? WHERE id = ?",
+            (body.score, comment, receipt, now, corr["id"]),
+        )
+    return {
+        "ok": True,
+        "paper_id": paper_id,
+        "reviewer_id": reviewer_id,
+        "serial": current_serial,
+        "correction_id": corr["id"],
+        "score": body.score,
+        "comment": comment,
+        "receipt": receipt,
+        "original_receipt": corr["original_receipt"],
+        "corrected_at": now,
+        "changed": True,
+    }
 
 
 # ---------------------------------------------------------------- 补位 (会务方)
